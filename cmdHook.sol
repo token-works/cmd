@@ -39,6 +39,10 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     uint128 private constant STARTING_BUY_FEE = 9900;
     /// @notice Portion of each sell allocated to permanently locked liquidity (in bips)
     uint128 public constant SELL_LIQUIDITY_LOCK_BIPS = 25;
+    /// @notice Target sell burn rate (2%)
+    uint128 public constant SELL_BURN_BIPS = 200;
+    /// @notice Maximum total sell-side fee, tax, and burn cap (10%)
+    uint128 public constant MAX_TOTAL_SELL_BIPS = 1000;
     /// @notice Maximum price limit for swaps
     uint160 private constant MAX_PRICE_LIMIT = TickMath.MAX_SQRT_PRICE - 1;
     /// @notice Minimum price limit for swaps
@@ -86,6 +90,8 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     event Trade(uint160 sqrtPriceX96, int128 ethAmount, int128 tokenAmount);
     /// @notice Emitted when sell-side tokens are permanently locked for liquidity support
     event SellLiquidityLocked(bytes32 indexed id, uint256 tokenAmount);
+    /// @notice Emitted when sell-side tokens are permanently burned
+    event SellBurn(bytes32 indexed id, uint256 tokenAmount);
 
     /* ═══════════════════════════════════════════════════════ */
     /*                      CONSTRUCTOR                        */
@@ -145,6 +151,16 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         if (feeReductions >= maxReducible) return RESTING_FEE;
 
         return uint128(STARTING_BUY_FEE - feeReductions);
+    }
+
+    /// @notice Returns the effective sell burn basis points after applying the 10% total sell-side cap
+    /// @param existingSellBips Existing sell-side fee/tax basis points applied before burn
+    /// @return Effective burn basis points for the sell
+    function calculateSellBurnBips(uint128 existingSellBips) public pure returns (uint128) {
+        if (existingSellBips >= MAX_TOTAL_SELL_BIPS) return 0;
+
+        uint128 remainingBips = MAX_TOTAL_SELL_BIPS - existingSellBips;
+        return remainingBips >= SELL_BURN_BIPS ? SELL_BURN_BIPS : remainingBips;
     }
 
     /// @notice Returns the hook's permissions for the Uniswap V4 pool
@@ -229,8 +245,7 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
             PoolId.unwrap(key.toId()), sender, ethFee ? uint128(totalFeeAmount) : 0, ethFee ? 0 : uint128(totalFeeAmount)
         );
 
-        // On sells, divert a small token amount to a permanently locked address.
-        // This is implemented by taking a portion of the sold token flow and sending it to an unrecoverable address.
+        // On sells, divert a small token amount to a permanently locked address and apply a capped sell burn.
         if (params.zeroForOne && !ethFee) {
             uint256 lockedLiquidityAmount = uint128(swapAmount) * SELL_LIQUIDITY_LOCK_BIPS / TOTAL_BIPS;
             if (lockedLiquidityAmount > 0) {
@@ -238,11 +253,23 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
                 emit SellLiquidityLocked(PoolId.unwrap(key.toId()), lockedLiquidityAmount);
             }
 
+            uint128 effectiveSellBurnBips = calculateSellBurnBips(currentFee + SELL_LIQUIDITY_LOCK_BIPS);
+            uint256 burnAmount = uint128(swapAmount) * effectiveSellBurnBips / TOTAL_BIPS;
+            if (burnAmount > 0) {
+                SafeTransferLib.safeTransfer(Currency.unwrap(key.currency1), address(0), burnAmount);
+                emit SellBurn(PoolId.unwrap(key.toId()), burnAmount);
+            }
+
             // Remaining token fees are swapped to ETH, then distributed
-            uint256 distributableTokenFeeAmount = totalFeeAmount > lockedLiquidityAmount ? totalFeeAmount - lockedLiquidityAmount : 0;
+            uint256 reservedTokenAmount = lockedLiquidityAmount + burnAmount;
+            uint256 distributableTokenFeeAmount =
+                totalFeeAmount > reservedTokenAmount ? totalFeeAmount - reservedTokenAmount : 0;
+
             if (distributableTokenFeeAmount > 0) {
                 uint256 ethReceived = _swapToEth(key, distributableTokenFeeAmount);
-                uint256 twEth = (ethReceived * twFeeAmount) / totalFeeAmount;
+                uint256 distributableFeeBase = totalFeeAmount > lockedLiquidityAmount ? totalFeeAmount - lockedLiquidityAmount : 0;
+                uint256 twEth = distributableFeeBase > 0 ? (ethReceived * twFeeAmount) / distributableFeeBase : 0;
+                if (twEth > ethReceived) twEth = ethReceived;
                 uint256 buybackEth = ethReceived - twEth;
                 SafeTransferLib.forceSafeTransferETH(feeAddress, twEth);
                 if (buybackEth > 0) {
