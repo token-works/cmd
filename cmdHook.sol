@@ -37,10 +37,14 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     uint128 private constant RESTING_FEE = 100;
     /// @notice Starting buy fee rate (99%) - decreases over time
     uint128 private constant STARTING_BUY_FEE = 9900;
+    /// @notice Portion of each sell allocated to permanently locked liquidity (in bips)
+    uint128 public constant SELL_LIQUIDITY_LOCK_BIPS = 25;
     /// @notice Maximum price limit for swaps
     uint160 private constant MAX_PRICE_LIMIT = TickMath.MAX_SQRT_PRICE - 1;
     /// @notice Minimum price limit for swaps
     uint160 private constant MIN_PRICE_LIMIT = TickMath.MIN_SQRT_PRICE + 1;
+    /// @notice Burn address used to permanently lock received liquidity-allocation tokens
+    address public constant LOCK_ADDRESS = address(0x000000000000000000000000000000000000dEaD);
 
     /* ═══════════════════════════════════════════════════════ */
     /*                    STATE VARIABLES                      */
@@ -80,6 +84,8 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     event HookFee(bytes32 indexed id, address indexed sender, uint128 feeAmount0, uint128 feeAmount1);
     /// @notice Emitted when a trade occurs in the pool
     event Trade(uint160 sqrtPriceX96, int128 ethAmount, int128 tokenAmount);
+    /// @notice Emitted when sell-side tokens are permanently locked for liquidity support
+    event SellLiquidityLocked(bytes32 indexed id, uint256 tokenAmount);
 
     /* ═══════════════════════════════════════════════════════ */
     /*                      CONSTRUCTOR                        */
@@ -206,6 +212,7 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         uint256 totalFeeAmount = uint128(swapAmount) * currentFee / TOTAL_BIPS;
 
         if (totalFeeAmount == 0) {
+            emit Trade(_getCurrentPrice(key), delta.amount0(), delta.amount1());
             return (BaseHook.afterSwap.selector, 0);
         }
 
@@ -222,8 +229,27 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
             PoolId.unwrap(key.toId()), sender, ethFee ? uint128(totalFeeAmount) : 0, ethFee ? 0 : uint128(totalFeeAmount)
         );
 
-        // Convert to ETH if fee is in tokens, then distribute
-        if (!ethFee) {
+        // On sells, divert a small token amount to a permanently locked address.
+        // This is implemented by taking a portion of the sold token flow and sending it to an unrecoverable address.
+        if (params.zeroForOne && !ethFee) {
+            uint256 lockedLiquidityAmount = uint128(swapAmount) * SELL_LIQUIDITY_LOCK_BIPS / TOTAL_BIPS;
+            if (lockedLiquidityAmount > 0) {
+                SafeTransferLib.safeTransfer(Currency.unwrap(key.currency1), LOCK_ADDRESS, lockedLiquidityAmount);
+                emit SellLiquidityLocked(PoolId.unwrap(key.toId()), lockedLiquidityAmount);
+            }
+
+            // Remaining token fees are swapped to ETH, then distributed
+            uint256 distributableTokenFeeAmount = totalFeeAmount > lockedLiquidityAmount ? totalFeeAmount - lockedLiquidityAmount : 0;
+            if (distributableTokenFeeAmount > 0) {
+                uint256 ethReceived = _swapToEth(key, distributableTokenFeeAmount);
+                uint256 twEth = (ethReceived * twFeeAmount) / totalFeeAmount;
+                uint256 buybackEth = ethReceived - twEth;
+                SafeTransferLib.forceSafeTransferETH(feeAddress, twEth);
+                if (buybackEth > 0) {
+                    SafeTransferLib.forceSafeTransferETH(buybackAddress, buybackEth);
+                }
+            }
+        } else if (!ethFee) {
             uint256 ethReceived = _swapToEth(key, totalFeeAmount);
             uint256 twEth = (ethReceived * twFeeAmount) / totalFeeAmount;
             uint256 buybackEth = ethReceived - twEth;
