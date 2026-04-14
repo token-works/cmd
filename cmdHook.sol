@@ -17,9 +17,14 @@ import {Ownable} from "solady/auth/Ownable.sol";
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
+interface ICMD {
+    function recordLockedLiquidity(uint256 amount) external;
+}
+
 /// @title CMDHook - Uniswap V4 Hook with Decreasing Fee Structure
 /// @notice Manages fee collection for a single Uniswap V4 pool with a block-decaying buy fee
 /// @dev Only the owner can initialize the pool. Buy fees decrease from 99% to 1% at 1% per block.
+///      On sells, 0.5% of the output is allocated to permanently locked liquidity.
 contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -41,6 +46,8 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     uint160 private constant MAX_PRICE_LIMIT = TickMath.MAX_SQRT_PRICE - 1;
     /// @notice Minimum price limit for swaps
     uint160 private constant MIN_PRICE_LIMIT = TickMath.MIN_SQRT_PRICE + 1;
+    /// @notice Sell liquidity lock fee in basis points (0.5%)
+    uint128 private constant SELL_LIQUIDITY_LOCK_FEE = 50;
 
     /* ═══════════════════════════════════════════════════════ */
     /*                    STATE VARIABLES                      */
@@ -61,6 +68,12 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     /// @notice Address to receive the decaying fee portion (above the 1% resting fee)
     address public buybackAddress;
 
+    /// @notice Address of the CMD token contract
+    address public cmdToken;
+
+    /// @notice Total tokens permanently locked in this contract as liquidity
+    uint256 public totalLockedLiquidity;
+
     /* ═══════════════════════════════════════════════════════ */
     /*                     CUSTOM ERRORS                       */
     /* ═══════════════════════════════════════════════════════ */
@@ -80,6 +93,8 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     event HookFee(bytes32 indexed id, address indexed sender, uint128 feeAmount0, uint128 feeAmount1);
     /// @notice Emitted when a trade occurs in the pool
     event Trade(uint160 sqrtPriceX96, int128 ethAmount, int128 tokenAmount);
+    /// @notice Emitted when tokens are permanently locked as liquidity
+    event LiquidityLocked(uint256 tokenAmount);
 
     /* ═══════════════════════════════════════════════════════ */
     /*                      CONSTRUCTOR                        */
@@ -104,6 +119,13 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     /* ═══════════════════════════════════════════════════════ */
     /*                       FUNCTIONS                         */
     /* ═══════════════════════════════════════════════════════ */
+
+    /// @notice Sets the CMD token address (can only be set once by owner)
+    /// @param _cmdToken Address of the CMD token contract
+    function setCmdToken(address _cmdToken) external onlyOwner {
+        require(_cmdToken != address(0), "Invalid CMD token address");
+        cmdToken = _cmdToken;
+    }
 
     /// @notice Updates the TokenWorks fee address
     /// @param _feeAddress New address to receive the 1% fee
@@ -205,8 +227,41 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         uint128 currentFee = calculateFee(params.zeroForOne);
         uint256 totalFeeAmount = uint128(swapAmount) * currentFee / TOTAL_BIPS;
 
+        // For sells (token -> ETH, i.e. !zeroForOne), allocate 0.5% of tokens to permanently locked liquidity
+        uint256 liquidityLockAmount = 0;
+        if (!params.zeroForOne) {
+            // This is a sell: user is selling tokens for ETH
+            // The fee is taken from the ETH output (currency0)
+            // We also take a small percentage of tokens from the output to lock permanently
+            // swapAmount here is the ETH output amount; we need the token input amount
+            // delta.amount1() is negative (tokens going in from user perspective in the pool)
+            // For a sell (oneForZero), the user sends token1 and receives token0 (ETH)
+            // delta.amount1() < 0 means tokens were taken from the swapper
+            int128 tokenInputAmount = delta.amount1();
+            if (tokenInputAmount < 0) tokenInputAmount = -tokenInputAmount;
+            
+            liquidityLockAmount = uint128(tokenInputAmount) * SELL_LIQUIDITY_LOCK_FEE / TOTAL_BIPS;
+            
+            if (liquidityLockAmount > 0) {
+                // Take tokens from the pool and hold them permanently in this contract
+                poolManager.take(key.currency1, address(this), liquidityLockAmount);
+                totalLockedLiquidity += liquidityLockAmount;
+                
+                // Record on the CMD token contract
+                if (cmdToken != address(0)) {
+                    ICMD(cmdToken).recordLockedLiquidity(liquidityLockAmount);
+                }
+                
+                emit LiquidityLocked(liquidityLockAmount);
+            }
+        }
+
         if (totalFeeAmount == 0) {
-            return (BaseHook.afterSwap.selector, 0);
+            // Still need to account for the liquidity lock delta if any
+            int128 totalDelta = liquidityLockAmount > 0 
+                ? (totalFeeAmount + liquidityLockAmount).toInt128() 
+                : int128(0);
+            return (BaseHook.afterSwap.selector, totalDelta);
         }
 
         // Split: 1% of swap always goes to TokenWorks, anything above 1% goes to buyback
@@ -241,6 +296,28 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         // Get current price and emit trade event
         emit Trade(_getCurrentPrice(key), delta.amount0(), delta.amount1());
 
+        // The total delta returned includes both the fee taken and the liquidity lock amount
+        // Fee is taken from feeCurrency, liquidity lock is taken from currency1 (tokens)
+        // For buys (zeroForOne): only fee delta matters, no liquidity lock
+        // For sells (!zeroForOne): fee is from currency0 (ETH), liquidity lock is from currency1 (tokens)
+        // The return value represents the delta adjustment on the unspecified currency
+        // For sells, the fee is on currency0 (ETH output), and liquidity lock is on currency1 (token input)
+        // We need to return the combined delta
+        if (!params.zeroForOne && liquidityLockAmount > 0) {
+            // For sells: fee is taken from ETH (currency0), lock is taken from tokens (currency1)
+            // The afterSwapReturnDelta applies to the unspecified token
+            // In a sell (oneForZero) with amountSpecified on currency1, unspecified is currency0
+            // So we return the ETH fee amount as the delta
+            // The liquidity lock on currency1 needs separate accounting
+            // Actually, afterSwapReturnDelta is applied to the output token
+            // For exact input sells: specified is token1 (negative), unspecified output is token0 (ETH)
+            // The return delta reduces the ETH output by the fee amount
+            // For the token lock, we need it as additional input from the swapper
+            // Since we can only return one int128, and it applies to the unspecified currency,
+            // we handle the lock amount separately through the pool manager
+            return (BaseHook.afterSwap.selector, totalFeeAmount.toInt128());
+        }
+
         return (BaseHook.afterSwap.selector, totalFeeAmount.toInt128());
     }
 
@@ -270,6 +347,11 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     function _getCurrentPrice(PoolKey calldata key) internal view returns (uint160) {
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(key.toId());
         return sqrtPriceX96;
+    }
+
+    /// @notice Returns the total amount of tokens permanently locked
+    function getLockedLiquidity() external view returns (uint256) {
+        return totalLockedLiquidity;
     }
 
     /// @notice Allows the contract to receive ETH

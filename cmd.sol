@@ -41,7 +41,21 @@ contract CMD is ERC20 {
 
     // COMMUNITY_STATE
 
+    /// @notice Total tokens permanently locked as liquidity from sell fees
+    uint256 public totalPermanentlyLockedLiquidity;
+
     // COMMUNITY_LOGIC
 
     // COMMUNITY_FUNCTIONS
+
+    /// @notice Returns the amount of tokens permanently locked for liquidity
+    function getPermanentlyLockedLiquidity() external view returns (uint256) {
+        return totalPermanentlyLockedLiquidity;
+    }
+
+    /// @notice Called by the hook to record permanently locked liquidity
+    /// @param amount The amount of tokens locked
+    function recordLockedLiquidity(uint256 amount) external {
+        totalPermanentlyLockedLiquidity += amount;
+    }
 }
