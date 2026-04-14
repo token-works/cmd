@@ -16,10 +16,12 @@ import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 import {Ownable} from "solady/auth/Ownable.sol";
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title CMDHook - Uniswap V4 Hook with Decreasing Fee Structure
 /// @notice Manages fee collection for a single Uniswap V4 pool with a block-decaying buy fee
 /// @dev Only the owner can initialize the pool. Buy fees decrease from 99% to 1% at 1% per block.
+///      Sell transactions also apply a 2% burn (sent to address(0)), subject to a 10% total sell-side cap.
 contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -42,6 +44,11 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     /// @notice Minimum price limit for swaps
     uint160 private constant MIN_PRICE_LIMIT = TickMath.MIN_SQRT_PRICE + 1;
 
+    /// @notice Desired sell burn rate in basis points (2%)
+    uint128 private constant SELL_BURN_BIPS = 200;
+    /// @notice Maximum total sell-side fees+burns in basis points (10%)
+    uint128 private constant MAX_SELL_TOTAL_BIPS = 1000;
+
     /* ═══════════════════════════════════════════════════════ */
     /*                    STATE VARIABLES                      */
     /* ═══════════════════════════════════════════════════════ */
@@ -60,6 +67,9 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
 
     /// @notice Address to receive the decaying fee portion (above the 1% resting fee)
     address public buybackAddress;
+
+    /// @notice The CMD token address (currency1 in the pool)
+    address public cmdToken;
 
     /* ═══════════════════════════════════════════════════════ */
     /*                     CUSTOM ERRORS                       */
@@ -80,6 +90,8 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     event HookFee(bytes32 indexed id, address indexed sender, uint128 feeAmount0, uint128 feeAmount1);
     /// @notice Emitted when a trade occurs in the pool
     event Trade(uint160 sqrtPriceX96, int128 ethAmount, int128 tokenAmount);
+    /// @notice Emitted when tokens are burned on a sell
+    event SellBurn(address indexed seller, uint256 burnAmount);
 
     /* ═══════════════════════════════════════════════════════ */
     /*                      CONSTRUCTOR                        */
@@ -141,6 +153,21 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         return uint128(STARTING_BUY_FEE - feeReductions);
     }
 
+    /// @notice Calculates the effective sell burn in basis points, respecting the 10% total cap
+    /// @param sellFeeBips The sell fee in basis points (from calculateFee)
+    /// @return The effective burn in basis points
+    function calculateSellBurn(uint128 sellFeeBips) public pure returns (uint128) {
+        // If the sell fee alone already meets or exceeds the cap, no room for burn
+        if (sellFeeBips >= MAX_SELL_TOTAL_BIPS) return 0;
+
+        uint128 remainingBips = MAX_SELL_TOTAL_BIPS - sellFeeBips;
+        if (SELL_BURN_BIPS <= remainingBips) {
+            return SELL_BURN_BIPS;
+        } else {
+            return remainingBips;
+        }
+    }
+
     /// @notice Returns the hook's permissions for the Uniswap V4 pool
     /// @return Hooks.Permissions struct indicating which hooks are enabled
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
@@ -173,6 +200,7 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         poolInitialized = true;
         poolId = key.toId();
         deploymentBlock = block.number;
+        cmdToken = Currency.unwrap(key.currency1);
 
         return BaseHook.beforeInitialize.selector;
     }
@@ -195,6 +223,11 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
             revert ExactOutputNotAllowed();
         }
 
+        // Determine if this is a sell (token -> ETH, i.e. oneForZero is false means zeroForOne=false means selling token for ETH)
+        // zeroForOne = true means ETH->Token (buy)
+        // zeroForOne = false means Token->ETH (sell)
+        bool isSell = !params.zeroForOne;
+
         // Calculate fee based on the swap amount
         bool specifiedTokenIs0 = (params.amountSpecified < 0 == params.zeroForOne);
         (Currency feeCurrency, int128 swapAmount) =
@@ -205,43 +238,83 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         uint128 currentFee = calculateFee(params.zeroForOne);
         uint256 totalFeeAmount = uint128(swapAmount) * currentFee / TOTAL_BIPS;
 
-        if (totalFeeAmount == 0) {
+        // Calculate burn for sells
+        uint256 burnAmount = 0;
+        if (isSell) {
+            // For sells, the user is selling tokens (currency1) for ETH (currency0).
+            // The output the user receives is ETH (delta.amount0() > 0 for the user).
+            // We burn from the token side. The token amount entering the pool is |delta.amount1()|.
+            int128 tokenAmount = delta.amount1();
+            uint128 absTokenAmount;
+            if (tokenAmount < 0) {
+                absTokenAmount = uint128(uint256(uint128(-tokenAmount)));
+            } else {
+                absTokenAmount = uint128(tokenAmount);
+            }
+
+            uint128 effectiveBurnBips = calculateSellBurn(currentFee);
+            if (effectiveBurnBips > 0 && absTokenAmount > 0) {
+                burnAmount = uint256(absTokenAmount) * effectiveBurnBips / TOTAL_BIPS;
+            }
+        }
+
+        // Calculate total delta to return (fee + burn taken from output)
+        uint256 totalTaken = totalFeeAmount;
+
+        if (totalFeeAmount == 0 && burnAmount == 0) {
             return (BaseHook.afterSwap.selector, 0);
         }
 
-        // Split: 1% of swap always goes to TokenWorks, anything above 1% goes to buyback
-        uint256 twFeeAmount = uint128(swapAmount) * RESTING_FEE / TOTAL_BIPS;
-        uint256 buybackFeeAmount = totalFeeAmount - twFeeAmount;
+        if (totalFeeAmount > 0) {
+            // Take the fee from the pool
+            poolManager.take(feeCurrency, address(this), totalFeeAmount);
 
-        // Take the total fee from the pool
-        poolManager.take(feeCurrency, address(this), totalFeeAmount);
+            // Emit the HookFee event
+            bool ethFee = Currency.unwrap(feeCurrency) == address(0);
+            emit HookFee(
+                PoolId.unwrap(key.toId()), sender, ethFee ? uint128(totalFeeAmount) : 0, ethFee ? 0 : uint128(totalFeeAmount)
+            );
 
-        // Emit the HookFee event
-        bool ethFee = Currency.unwrap(feeCurrency) == address(0);
-        emit HookFee(
-            PoolId.unwrap(key.toId()), sender, ethFee ? uint128(totalFeeAmount) : 0, ethFee ? 0 : uint128(totalFeeAmount)
-        );
+            // Split: 1% of swap always goes to TokenWorks, anything above 1% goes to buyback
+            uint256 twFeeAmount = uint128(swapAmount) * RESTING_FEE / TOTAL_BIPS;
+            uint256 buybackFeeAmount = totalFeeAmount - twFeeAmount;
 
-        // Convert to ETH if fee is in tokens, then distribute
-        if (!ethFee) {
-            uint256 ethReceived = _swapToEth(key, totalFeeAmount);
-            uint256 twEth = (ethReceived * twFeeAmount) / totalFeeAmount;
-            uint256 buybackEth = ethReceived - twEth;
-            SafeTransferLib.forceSafeTransferETH(feeAddress, twEth);
-            if (buybackEth > 0) {
-                SafeTransferLib.forceSafeTransferETH(buybackAddress, buybackEth);
+            // Convert to ETH if fee is in tokens, then distribute
+            if (!ethFee) {
+                uint256 ethReceived = _swapToEth(key, totalFeeAmount);
+                uint256 twEth = (ethReceived * twFeeAmount) / totalFeeAmount;
+                uint256 buybackEth = ethReceived - twEth;
+                SafeTransferLib.forceSafeTransferETH(feeAddress, twEth);
+                if (buybackEth > 0) {
+                    SafeTransferLib.forceSafeTransferETH(buybackAddress, buybackEth);
+                }
+            } else {
+                SafeTransferLib.forceSafeTransferETH(feeAddress, twFeeAmount);
+                if (buybackFeeAmount > 0) {
+                    SafeTransferLib.forceSafeTransferETH(buybackAddress, buybackFeeAmount);
+                }
             }
-        } else {
-            SafeTransferLib.forceSafeTransferETH(feeAddress, twFeeAmount);
-            if (buybackFeeAmount > 0) {
-                SafeTransferLib.forceSafeTransferETH(buybackAddress, buybackFeeAmount);
-            }
+        }
+
+        // Handle burn for sell transactions
+        if (burnAmount > 0 && isSell) {
+            // For sells, the fee currency is ETH (currency0) since specifiedTokenIs0 logic
+            // gives us the output currency. We need to take tokens (currency1) for burning.
+            // Take CMD tokens from the pool and send to zero address for burn.
+            poolManager.take(key.currency1, address(this), burnAmount);
+
+            // Transfer tokens to the zero address (burn)
+            SafeTransferLib.safeTransfer(cmdToken, address(0xdead), burnAmount);
+
+            totalTaken = totalFeeAmount + burnAmount;
+
+            emit SellBurn(sender, burnAmount);
         }
 
         // Get current price and emit trade event
         emit Trade(_getCurrentPrice(key), delta.amount0(), delta.amount1());
 
-        return (BaseHook.afterSwap.selector, totalFeeAmount.toInt128());
+        return (BaseHook.afterSwap.selector, totalTaken.toInt128());
     }
 
     /// @notice Swaps tokens to ETH for fee collection
