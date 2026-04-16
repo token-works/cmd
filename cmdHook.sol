@@ -18,9 +18,13 @@ import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-/// @title CMDHook - Uniswap V4 Hook with Decreasing Fee Structure
+/// @title CMDHook - Uniswap V4 Hook with Decreasing Fee Structure & Adaptive Sell-Pressure Dampener
 /// @notice Manages fee collection for a single Uniswap V4 pool with a block-decaying buy fee
+///         and a dynamic sell fee that responds to recent sell pressure over a rolling window.
 /// @dev Only the owner can initialize the pool. Buy fees decrease from 99% to 1% at 1% per block.
+///      Sell fees start at a 1% baseline and increase proportionally when sell volume exceeds a
+///      threshold percentage of total supply within a rolling time window, capped at a maximum.
+///      Any sell fee above the baseline is routed to the buyback/treasury reserve.
 contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -42,6 +46,28 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     uint160 private constant MAX_PRICE_LIMIT = TickMath.MAX_SQRT_PRICE - 1;
     /// @notice Minimum price limit for swaps
     uint160 private constant MIN_PRICE_LIMIT = TickMath.MIN_SQRT_PRICE + 1;
+
+    /* ═══════════════════════════════════════════════════════ */
+    /*            SELL-PRESSURE DAMPENER CONSTANTS             */
+    /* ═══════════════════════════════════════════════════════ */
+
+    /// @notice Number of buckets in the rolling window
+    uint256 private constant NUM_BUCKETS = 12;
+
+    /// @notice Duration of each bucket in seconds (5 minutes each, 12 buckets = 60 minutes)
+    uint256 private constant BUCKET_DURATION = 5 minutes;
+
+    /// @notice Sell volume threshold as basis points of total supply (0.5% = 50 bips)
+    /// @dev When rolling sell volume exceeds this % of total supply, the sell fee starts increasing
+    uint256 private constant SELL_THRESHOLD_BIPS = 50;
+
+    /// @notice Maximum sell fee in basis points (10%)
+    uint128 private constant MAX_SELL_FEE = 1000;
+
+    /// @notice Sell fee scaling factor: how aggressively the fee increases above threshold
+    /// @dev Fee = RESTING_FEE + (excessRatio * SELL_FEE_SCALE_BIPS), capped at MAX_SELL_FEE
+    ///      excessRatio is (excessVolume / thresholdVolume) expressed in bips
+    uint256 private constant SELL_FEE_SCALE_BIPS = 900;
 
     /* ═══════════════════════════════════════════════════════ */
     /*                    STATE VARIABLES                      */
@@ -66,6 +92,22 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     address public cmdToken;
 
     /* ═══════════════════════════════════════════════════════ */
+    /*            SELL-PRESSURE DAMPENER STATE                 */
+    /* ═══════════════════════════════════════════════════════ */
+
+    /// @notice Rolling window bucket sell volumes (CMD tokens sold into pool)
+    uint256[12] public sellBuckets;
+
+    /// @notice Timestamp when each bucket was last written to
+    uint256[12] public bucketTimestamps;
+
+    /// @notice The index of the current active bucket
+    uint256 public currentBucketIndex;
+
+    /// @notice The timestamp when the current bucket started
+    uint256 public currentBucketStart;
+
+    /* ═══════════════════════════════════════════════════════ */
     /*                     CUSTOM ERRORS                       */
     /* ═══════════════════════════════════════════════════════ */
 
@@ -84,6 +126,8 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     event HookFee(bytes32 indexed id, address indexed sender, uint128 feeAmount0, uint128 feeAmount1);
     /// @notice Emitted when a trade occurs in the pool
     event Trade(uint160 sqrtPriceX96, int128 ethAmount, int128 tokenAmount);
+    /// @notice Emitted when the adaptive sell fee is applied
+    event AdaptiveSellFee(uint128 sellFeeBips, uint256 rollingSellVolume, uint256 threshold);
 
     /* ═══════════════════════════════════════════════════════ */
     /*                      CONSTRUCTOR                        */
@@ -126,12 +170,117 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         SafeTransferLib.forceSafeTransferETH(feeAddress, address(this).balance);
     }
 
+    /* ═══════════════════════════════════════════════════════ */
+    /*            SELL-PRESSURE DAMPENER LOGIC                 */
+    /* ═══════════════════════════════════════════════════════ */
+
+    /// @notice Advances the rolling window buckets, clearing stale ones
+    function _advanceBuckets() internal {
+        if (currentBucketStart == 0) {
+            // First call: initialize
+            currentBucketStart = block.timestamp;
+            currentBucketIndex = 0;
+            return;
+        }
+
+        uint256 elapsed = block.timestamp - currentBucketStart;
+        if (elapsed < BUCKET_DURATION) {
+            // Still in the same bucket
+            return;
+        }
+
+        // How many buckets have passed
+        uint256 bucketsPassed = elapsed / BUCKET_DURATION;
+        if (bucketsPassed > NUM_BUCKETS) {
+            bucketsPassed = NUM_BUCKETS;
+        }
+
+        // Clear the buckets that have been passed over
+        for (uint256 i = 1; i <= bucketsPassed; i++) {
+            uint256 idx = (currentBucketIndex + i) % NUM_BUCKETS;
+            sellBuckets[idx] = 0;
+            bucketTimestamps[idx] = 0;
+        }
+
+        // Move to the new current bucket
+        currentBucketIndex = (currentBucketIndex + bucketsPassed) % NUM_BUCKETS;
+        currentBucketStart = currentBucketStart + (bucketsPassed * BUCKET_DURATION);
+    }
+
+    /// @notice Records a sell volume into the current bucket
+    /// @param amount The CMD amount sold
+    function _recordSellVolume(uint256 amount) internal {
+        _advanceBuckets();
+        sellBuckets[currentBucketIndex] += amount;
+        bucketTimestamps[currentBucketIndex] = block.timestamp;
+    }
+
+    /// @notice Computes the total sell volume across all active (non-stale) buckets
+    /// @return total The rolling sell volume
+    function getRollingSellVolume() public view returns (uint256 total) {
+        if (currentBucketStart == 0) return 0;
+
+        uint256 elapsed = block.timestamp - currentBucketStart;
+        uint256 bucketsPassed = elapsed / BUCKET_DURATION;
+        if (bucketsPassed > NUM_BUCKETS) {
+            // All buckets are stale
+            return 0;
+        }
+
+        // Sum all buckets, skipping ones that would be cleared by _advanceBuckets
+        for (uint256 i = 0; i < NUM_BUCKETS; i++) {
+            // Check if this bucket would be cleared
+            // Buckets from (currentBucketIndex+1) to (currentBucketIndex+bucketsPassed) would be cleared
+            bool wouldBeCleared = false;
+            for (uint256 j = 1; j <= bucketsPassed; j++) {
+                if (i == (currentBucketIndex + j) % NUM_BUCKETS) {
+                    wouldBeCleared = true;
+                    break;
+                }
+            }
+            if (!wouldBeCleared) {
+                total += sellBuckets[i];
+            }
+        }
+    }
+
+    /// @notice Calculates the adaptive sell fee based on rolling sell pressure
+    /// @return The sell fee in basis points
+    function calculateSellFee() public view returns (uint128) {
+        if (cmdToken == address(0)) return RESTING_FEE;
+
+        uint256 rollingSellVol = getRollingSellVolume();
+        uint256 supply = IERC20(cmdToken).totalSupply();
+        if (supply == 0) return RESTING_FEE;
+
+        uint256 threshold = (supply * SELL_THRESHOLD_BIPS) / TOTAL_BIPS;
+        if (threshold == 0) return RESTING_FEE;
+
+        if (rollingSellVol <= threshold) {
+            return RESTING_FEE;
+        }
+
+        // Calculate excess ratio in bips: (excess / threshold) * TOTAL_BIPS
+        uint256 excess = rollingSellVol - threshold;
+        uint256 excessRatioBips = (excess * TOTAL_BIPS) / threshold;
+
+        // Scale the additional fee
+        uint256 additionalFee = (excessRatioBips * SELL_FEE_SCALE_BIPS) / TOTAL_BIPS;
+        uint256 totalFee = uint256(RESTING_FEE) + additionalFee;
+
+        if (totalFee > MAX_SELL_FEE) {
+            totalFee = MAX_SELL_FEE;
+        }
+
+        return uint128(totalFee);
+    }
+
     /// @notice Calculates current fee based on blocks since deployment and swap direction
     /// @param isBuying True if buying tokens (ETH -> tokens), false if selling
     /// @return Current fee in basis points
-    /// @dev Buy fees decrease from 99% to 1% at 1% per block. Sell fees are constant 1%.
+    /// @dev Buy fees decrease from 99% to 1% at 1% per block. Sell fees are adaptive.
     function calculateFee(bool isBuying) public view returns (uint128) {
-        if (!isBuying) return RESTING_FEE;
+        if (!isBuying) return calculateSellFee();
 
         uint256 deployedAt = deploymentBlock;
         if (deployedAt == 0) return RESTING_FEE;
@@ -200,6 +349,26 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
             revert ExactOutputNotAllowed();
         }
 
+        // Determine if this is a sell (token -> ETH, i.e. oneForZero where currency1 is CMD)
+        // zeroForOne = true means ETH -> CMD (buy)
+        // zeroForOne = false means CMD -> ETH (sell)
+        bool isSell = !params.zeroForOne;
+
+        // If selling, record the sell volume for the dampener
+        if (isSell) {
+            // The amount of CMD sold into the pool
+            // For a oneForZero swap (sell), delta.amount1() is negative (CMD leaving user)
+            // params.amountSpecified is negative (exact input), so the CMD amount is -params.amountSpecified
+            int128 cmdDelta = delta.amount1();
+            uint256 cmdSold;
+            if (cmdDelta < 0) {
+                cmdSold = uint256(uint128(-cmdDelta));
+            } else {
+                cmdSold = uint256(uint128(cmdDelta));
+            }
+            _recordSellVolume(cmdSold);
+        }
+
         // Calculate fee based on the swap amount
         bool specifiedTokenIs0 = (params.amountSpecified < 0 == params.zeroForOne);
         (Currency feeCurrency, int128 swapAmount) =
@@ -222,6 +391,13 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         emit HookFee(
             PoolId.unwrap(key.toId()), sender, ethFee ? uint128(totalFeeAmount) : 0, ethFee ? 0 : uint128(totalFeeAmount)
         );
+
+        // Emit adaptive sell fee info for sells
+        if (isSell && currentFee > RESTING_FEE) {
+            uint256 supply = IERC20(cmdToken).totalSupply();
+            uint256 threshold = (supply * SELL_THRESHOLD_BIPS) / TOTAL_BIPS;
+            emit AdaptiveSellFee(currentFee, getRollingSellVolume(), threshold);
+        }
 
         // Split: 1% of swap always goes to TokenWorks, anything above 1% goes to buyback
         uint256 twFeeAmount = uint128(swapAmount) * RESTING_FEE / TOTAL_BIPS;
