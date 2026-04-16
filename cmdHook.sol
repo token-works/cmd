@@ -17,9 +17,9 @@ import {Ownable} from "solady/auth/Ownable.sol";
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
-/// @title CMDHook - Uniswap V4 Hook with Decreasing Fee Structure
-/// @notice Manages fee collection for a single Uniswap V4 pool with a block-decaying buy fee
-/// @dev Only the owner can initialize the pool. Buy fees decrease from 99% to 1% at 1% per block.
+/// @title CMDHook - Uniswap V4 Hook with Adaptive Sell-Pressure Dampener
+/// @notice Applies a dynamic sell-side fee based on recent sell pressure over a rolling window
+/// @dev Buys retain the resting fee. Additional sell fee above baseline is routed to the buyback reserve.
 contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -31,63 +31,52 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     /*                       CONSTANTS                        */
     /* ═══════════════════════════════════════════════════════ */
 
-    /// @notice Total basis points for percentage calculations
     uint128 private constant TOTAL_BIPS = 10000;
-    /// @notice Resting fee rate (1%) - always goes to TokenWorks
     uint128 private constant RESTING_FEE = 100;
-    /// @notice Starting buy fee rate (99%) - decreases over time
-    uint128 private constant STARTING_BUY_FEE = 9900;
-    /// @notice Maximum price limit for swaps
+    uint128 private constant MAX_SELL_FEE = 1000;
     uint160 private constant MAX_PRICE_LIMIT = TickMath.MAX_SQRT_PRICE - 1;
+
+    uint256 public constant WINDOW_DURATION = 60 minutes;
+    uint256 public constant EPOCH_DURATION = 5 minutes;
+    uint256 public constant WINDOW_EPOCHS = 12;
+    uint256 public constant INITIAL_SUPPLY = 1_000_000_000 ether;
+    uint256 public constant SELL_PRESSURE_THRESHOLD_BIPS = 50;
 
     /* ═══════════════════════════════════════════════════════ */
     /*                    STATE VARIABLES                      */
     /* ═══════════════════════════════════════════════════════ */
 
-    /// @notice Block number when the pool was deployed
     uint256 public deploymentBlock;
-
-    /// @notice The pool ID of the single pool managed by this hook
     PoolId public poolId;
-
-    /// @notice Whether the pool has been initialized
     bool public poolInitialized;
-
-    /// @notice Address to receive the 1% TokenWorks fee
     address public feeAddress;
-
-    /// @notice Address to receive the decaying fee portion (above the 1% resting fee)
     address public buybackAddress;
+
+    uint256[WINDOW_EPOCHS] private sellVolumeBuckets;
+    uint256 private bucketCursor;
+    uint256 private bucketStartTime;
+    uint256 public rollingSellVolume;
 
     /* ═══════════════════════════════════════════════════════ */
     /*                     CUSTOM ERRORS                       */
     /* ═══════════════════════════════════════════════════════ */
 
-    /// @notice Pool has already been initialized
     error PoolAlreadyInitialized();
-    /// @notice Caller is not the owner
     error NotOwner();
-    /// @notice Restrict ExactOutput swaps
     error ExactOutputNotAllowed();
 
     /* ═══════════════════════════════════════════════════════ */
     /*                     CUSTOM EVENTS                       */
     /* ═══════════════════════════════════════════════════════ */
 
-    /// @notice Emitted when fees are collected from a swap
     event HookFee(bytes32 indexed id, address indexed sender, uint128 feeAmount0, uint128 feeAmount1);
-    /// @notice Emitted when a trade occurs in the pool
     event Trade(uint160 sqrtPriceX96, int128 ethAmount, int128 tokenAmount);
+    event SellPressureUpdated(uint256 rollingSellVolume, uint128 sellFeeBips);
 
     /* ═══════════════════════════════════════════════════════ */
     /*                      CONSTRUCTOR                        */
     /* ═══════════════════════════════════════════════════════ */
 
-    /// @notice Initializes the hook with required dependencies
-    /// @param _poolManager The Uniswap V4 Pool Manager
-    /// @param _owner The owner of this hook
-    /// @param _feeAddress Address to receive the 1% fee
-    /// @param _buybackAddress New address to receive buyback fees
     constructor(
         IPoolManager _poolManager,
         address _owner,
@@ -103,44 +92,31 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     /*                       FUNCTIONS                         */
     /* ═══════════════════════════════════════════════════════ */
 
-    /// @notice Updates the TokenWorks fee address
-    /// @param _feeAddress New address to receive the 1% fee
     function updateFeeAddress(address _feeAddress) external onlyOwner {
         feeAddress = _feeAddress;
     }
 
-    /// @notice Updates the buyback address for the decaying fee portion
-    /// @param _buybackAddress New address to receive buyback fees
     function updateBuybackAddress(address _buybackAddress) external onlyOwner {
         buybackAddress = _buybackAddress;
     }
 
-    /// @notice Withdraws accumulated ETH fees to the fee address
     function withdrawFees() external onlyOwner {
         SafeTransferLib.forceSafeTransferETH(feeAddress, address(this).balance);
     }
 
-    /// @notice Calculates current fee based on blocks since deployment and swap direction
-    /// @param isBuying True if buying tokens (ETH -> tokens), false if selling
-    /// @return Current fee in basis points
-    /// @dev Buy fees decrease from 99% to 1% at 1% per block. Sell fees are constant 1%.
     function calculateFee(bool isBuying) public view returns (uint128) {
-        if (!isBuying) return RESTING_FEE;
-
-        uint256 deployedAt = deploymentBlock;
-        if (deployedAt == 0) return RESTING_FEE;
-
-        uint256 blocksPassed = block.number - deployedAt;
-        uint256 feeReductions = blocksPassed * 100; // 100 bips (1%) per block
-
-        uint256 maxReducible = STARTING_BUY_FEE - RESTING_FEE;
-        if (feeReductions >= maxReducible) return RESTING_FEE;
-
-        return uint128(STARTING_BUY_FEE - feeReductions);
+        if (isBuying) return RESTING_FEE;
+        return _currentSellFee(rollingSellVolume);
     }
 
-    /// @notice Returns the hook's permissions for the Uniswap V4 pool
-    /// @return Hooks.Permissions struct indicating which hooks are enabled
+    function currentSellFee() external view returns (uint128) {
+        return _currentSellFee(_viewRollingSellVolume());
+    }
+
+    function currentRollingSellVolume() external view returns (uint256) {
+        return _viewRollingSellVolume();
+    }
+
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: true,
@@ -160,9 +136,6 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         });
     }
 
-    /// @notice Validates initialization of the pool - only owner, only once
-    /// @param key The pool key containing currency pair and hook information
-    /// @return Selector indicating successful hook execution
     function _beforeInitialize(address sender, PoolKey calldata key, uint160) internal override returns (bytes4) {
         if (poolInitialized) revert PoolAlreadyInitialized();
         if (sender != owner()) revert NotOwner();
@@ -171,16 +144,11 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         poolInitialized = true;
         poolId = key.toId();
         deploymentBlock = block.number;
+        bucketStartTime = block.timestamp;
 
         return BaseHook.beforeInitialize.selector;
     }
 
-    /// @notice Processes swap events and takes the swap fee
-    /// @param sender The address initiating the call (router)
-    /// @param key The pool key containing token pair and fee information
-    /// @param params Swap parameters including direction and amount
-    /// @param delta Balance changes resulting from the swap
-    /// @return Hook selector and fee amount taken
     function _afterSwap(
         address sender,
         PoolKey calldata key,
@@ -198,7 +166,19 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
 
         if (swapAmount < 0) swapAmount = -swapAmount;
 
-        uint128 currentFee = calculateFee(params.zeroForOne);
+        _rollWindow();
+
+        uint128 currentFee;
+        uint256 sellAmount;
+        if (params.zeroForOne) {
+            sellAmount = uint256(uint128(swapAmount));
+            _recordSellVolume(sellAmount);
+            currentFee = _currentSellFee(rollingSellVolume);
+            emit SellPressureUpdated(rollingSellVolume, currentFee);
+        } else {
+            currentFee = RESTING_FEE;
+        }
+
         uint256 totalFeeAmount = uint128(swapAmount) * currentFee / TOTAL_BIPS;
 
         if (totalFeeAmount == 0) {
@@ -206,8 +186,8 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
             return (BaseHook.afterSwap.selector, 0);
         }
 
-        uint256 twFeeAmount = uint128(swapAmount) * RESTING_FEE / TOTAL_BIPS;
-        uint256 buybackFeeAmount = totalFeeAmount - twFeeAmount;
+        uint256 baselineFeeAmount = uint128(swapAmount) * RESTING_FEE / TOTAL_BIPS;
+        uint256 excessFeeAmount = totalFeeAmount > baselineFeeAmount ? totalFeeAmount - baselineFeeAmount : 0;
 
         poolManager.take(feeCurrency, address(this), totalFeeAmount);
 
@@ -218,16 +198,20 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
 
         if (!ethFee) {
             uint256 ethReceived = _swapToEth(key, totalFeeAmount);
-            uint256 twEth = (ethReceived * twFeeAmount) / totalFeeAmount;
-            uint256 buybackEth = ethReceived - twEth;
-            SafeTransferLib.forceSafeTransferETH(feeAddress, twEth);
-            if (buybackEth > 0) {
-                SafeTransferLib.forceSafeTransferETH(buybackAddress, buybackEth);
+            uint256 baselineEth = (ethReceived * baselineFeeAmount) / totalFeeAmount;
+            uint256 excessEth = ethReceived - baselineEth;
+            if (baselineEth > 0) {
+                SafeTransferLib.forceSafeTransferETH(feeAddress, baselineEth);
+            }
+            if (excessEth > 0) {
+                SafeTransferLib.forceSafeTransferETH(buybackAddress, excessEth);
             }
         } else {
-            SafeTransferLib.forceSafeTransferETH(feeAddress, twFeeAmount);
-            if (buybackFeeAmount > 0) {
-                SafeTransferLib.forceSafeTransferETH(buybackAddress, buybackFeeAmount);
+            if (baselineFeeAmount > 0) {
+                SafeTransferLib.forceSafeTransferETH(feeAddress, baselineFeeAmount);
+            }
+            if (excessFeeAmount > 0) {
+                SafeTransferLib.forceSafeTransferETH(buybackAddress, excessFeeAmount);
             }
         }
 
@@ -236,10 +220,6 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         return (BaseHook.afterSwap.selector, totalFeeAmount.toInt128());
     }
 
-    /// @notice Swaps tokens to ETH for fee collection
-    /// @param key The pool key for the swap
-    /// @param amount The amount of tokens to swap
-    /// @return The amount of ETH received from the swap
     function _swapToEth(PoolKey memory key, uint256 amount) internal returns (uint256) {
         uint256 ethBefore = address(this).balance;
 
@@ -255,14 +235,81 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         return address(this).balance - ethBefore;
     }
 
-    /// @notice Gets the current price from the pool's slot0
-    /// @param key The pool key
-    /// @return The current sqrtPriceX96
     function _getCurrentPrice(PoolKey calldata key) internal view returns (uint160) {
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(key.toId());
         return sqrtPriceX96;
     }
 
-    /// @notice Allows the contract to receive ETH
+    function _rollWindow() internal {
+        uint256 start = bucketStartTime;
+        if (start == 0) {
+            bucketStartTime = block.timestamp;
+            return;
+        }
+
+        uint256 elapsed = block.timestamp - start;
+        if (elapsed < EPOCH_DURATION) return;
+
+        uint256 steps = elapsed / EPOCH_DURATION;
+        if (steps >= WINDOW_EPOCHS) {
+            for (uint256 i = 0; i < WINDOW_EPOCHS; i++) {
+                sellVolumeBuckets[i] = 0;
+            }
+            rollingSellVolume = 0;
+            bucketCursor = 0;
+            bucketStartTime = block.timestamp;
+            return;
+        }
+
+        for (uint256 i = 0; i < steps; i++) {
+            bucketCursor = (bucketCursor + 1) % WINDOW_EPOCHS;
+            uint256 expired = sellVolumeBuckets[bucketCursor];
+            if (expired != 0) {
+                rollingSellVolume -= expired;
+                sellVolumeBuckets[bucketCursor] = 0;
+            }
+        }
+
+        bucketStartTime = start + steps * EPOCH_DURATION;
+    }
+
+    function _recordSellVolume(uint256 amount) internal {
+        sellVolumeBuckets[bucketCursor] += amount;
+        rollingSellVolume += amount;
+    }
+
+    function _currentSellFee(uint256 sellVolume) internal pure returns (uint128) {
+        uint256 thresholdVolume = (INITIAL_SUPPLY * SELL_PRESSURE_THRESHOLD_BIPS) / TOTAL_BIPS;
+        if (sellVolume <= thresholdVolume) return RESTING_FEE;
+
+        uint256 excessVolume = sellVolume - thresholdVolume;
+        uint256 feeRange = MAX_SELL_FEE - RESTING_FEE;
+        uint256 additionalFee = (excessVolume * feeRange) / thresholdVolume;
+
+        if (additionalFee >= feeRange) return MAX_SELL_FEE;
+        return uint128(RESTING_FEE + additionalFee);
+    }
+
+    function _viewRollingSellVolume() internal view returns (uint256) {
+        uint256 start = bucketStartTime;
+        if (start == 0) return rollingSellVolume;
+
+        uint256 elapsed = block.timestamp - start;
+        if (elapsed < EPOCH_DURATION) return rollingSellVolume;
+
+        uint256 steps = elapsed / EPOCH_DURATION;
+        if (steps >= WINDOW_EPOCHS) return 0;
+
+        uint256 simulatedRolling = rollingSellVolume;
+        uint256 simulatedCursor = bucketCursor;
+
+        for (uint256 i = 0; i < steps; i++) {
+            simulatedCursor = (simulatedCursor + 1) % WINDOW_EPOCHS;
+            simulatedRolling -= sellVolumeBuckets[simulatedCursor];
+        }
+
+        return simulatedRolling;
+    }
+
     receive() external payable {}
 }
