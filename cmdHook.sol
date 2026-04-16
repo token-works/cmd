@@ -17,6 +17,11 @@ import {Ownable} from "solady/auth/Ownable.sol";
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
+interface ICommandToken {
+    function balanceOf(address account) external view returns (uint256);
+    function burnFromHook(address from, uint256 amount) external;
+}
+
 /// @title CMDHook - Uniswap V4 Hook with Adaptive Sell-Pressure Dampener
 /// @notice Applies a dynamic sell-side fee based on recent sell pressure over a rolling window
 /// @dev Buys retain the resting fee. Additional sell fee above baseline is routed to the buyback reserve.
@@ -35,12 +40,16 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     uint128 private constant RESTING_FEE = 100;
     uint128 private constant MAX_SELL_FEE = 1000;
     uint160 private constant MAX_PRICE_LIMIT = TickMath.MAX_SQRT_PRICE - 1;
+    uint160 private constant MIN_PRICE_LIMIT = TickMath.MIN_SQRT_PRICE + 1;
 
     uint256 public constant WINDOW_DURATION = 60 minutes;
     uint256 public constant EPOCH_DURATION = 5 minutes;
     uint256 public constant WINDOW_EPOCHS = 12;
     uint256 public constant INITIAL_SUPPLY = 1_000_000_000 ether;
     uint256 public constant SELL_PRESSURE_THRESHOLD_BIPS = 50;
+    uint256 public constant HARVEST_INTERVAL = 50000;
+    uint256 public constant HARVEST_LP_BIPS = 100;
+    uint256 public constant HARVEST_BOUNTY_BIPS = 10;
 
     /* ═══════════════════════════════════════════════════════ */
     /*                    STATE VARIABLES                      */
@@ -57,6 +66,12 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     uint256 private bucketStartTime;
     uint256 public rollingSellVolume;
 
+    PoolKey public harvestPoolKey;
+    bool public harvestPoolKeySet;
+    address public cmdToken;
+    bool public cmdIsCurrency0;
+    uint256 public lastHarvestedCycle;
+
     /* ═══════════════════════════════════════════════════════ */
     /*                     CUSTOM ERRORS                       */
     /* ═══════════════════════════════════════════════════════ */
@@ -64,6 +79,9 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     error PoolAlreadyInitialized();
     error NotOwner();
     error ExactOutputNotAllowed();
+    error HarvestUnavailable();
+    error HarvestAlreadyExecuted();
+    error InvalidCommandToken();
 
     /* ═══════════════════════════════════════════════════════ */
     /*                     CUSTOM EVENTS                       */
@@ -72,6 +90,9 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     event HookFee(bytes32 indexed id, address indexed sender, uint128 feeAmount0, uint128 feeAmount1);
     event Trade(uint160 sqrtPriceX96, int128 ethAmount, int128 tokenAmount);
     event SellPressureUpdated(uint256 rollingSellVolume, uint128 sellFeeBips);
+    event HarvestBurned(
+        uint256 indexed cycle, uint256 cmdFromLP, uint256 cmdFromSwap, uint256 totalBurned, uint256 bounty
+    );
 
     /* ═══════════════════════════════════════════════════════ */
     /*                      CONSTRUCTOR                        */
@@ -117,6 +138,49 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         return _viewRollingSellVolume();
     }
 
+    function currentCycle() public view returns (uint256) {
+        if (deploymentBlock == 0 || block.number < deploymentBlock + HARVEST_INTERVAL) {
+            return 0;
+        }
+        return ((block.number - deploymentBlock) / HARVEST_INTERVAL);
+    }
+
+    function nextHarvestBlock() external view returns (uint256) {
+        if (deploymentBlock == 0) return 0;
+        return deploymentBlock + ((lastHarvestedCycle + 1) * HARVEST_INTERVAL);
+    }
+
+    function harvestAndBurn() external nonReentrant {
+        if (!poolInitialized || !harvestPoolKeySet) revert HarvestUnavailable();
+
+        uint256 cycle = currentCycle();
+        if (cycle == 0) revert HarvestUnavailable();
+        if (cycle <= lastHarvestedCycle) revert HarvestAlreadyExecuted();
+
+        lastHarvestedCycle = cycle;
+
+        (uint256 lpCmdAmount, uint256 lpPairedAmount) = _removeLiquidityShare(HARVEST_LP_BIPS);
+
+        uint256 cmdFromSwap = 0;
+        if (lpPairedAmount > 0) {
+            cmdFromSwap = _swapPairedForCmd(lpPairedAmount);
+        }
+
+        uint256 contractCmdBalance = ICommandToken(cmdToken).balanceOf(address(this));
+        uint256 bounty = (contractCmdBalance * HARVEST_BOUNTY_BIPS) / TOTAL_BIPS;
+        uint256 totalBurned = contractCmdBalance - bounty;
+
+        if (bounty > 0) {
+            SafeTransferLib.safeTransfer(cmdToken, msg.sender, bounty);
+        }
+
+        if (totalBurned > 0) {
+            ICommandToken(cmdToken).burnFromHook(address(this), totalBurned);
+        }
+
+        emit HarvestBurned(cycle, lpCmdAmount, cmdFromSwap, totalBurned, bounty);
+    }
+
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: true,
@@ -145,6 +209,13 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         poolId = key.toId();
         deploymentBlock = block.number;
         bucketStartTime = block.timestamp;
+        harvestPoolKey = key;
+        harvestPoolKeySet = true;
+
+        address tokenAddress = Currency.unwrap(key.currency1);
+        if (tokenAddress == address(0)) revert InvalidCommandToken();
+        cmdToken = tokenAddress;
+        cmdIsCurrency0 = false;
 
         return BaseHook.beforeInitialize.selector;
     }
@@ -233,6 +304,41 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         key.currency0.take(poolManager, address(this), uint256(int256(delta.amount0())), false);
 
         return address(this).balance - ethBefore;
+    }
+
+    function _swapPairedForCmd(uint256 amountIn) internal returns (uint256 cmdOut) {
+        PoolKey memory key = harvestPoolKey;
+        uint256 cmdBefore = ICommandToken(cmdToken).balanceOf(address(this));
+
+        if (cmdIsCurrency0) {
+            BalanceDelta delta = poolManager.swap(
+                key,
+                SwapParams({zeroForOne: false, amountSpecified: -int256(amountIn), sqrtPriceLimitX96: MAX_PRICE_LIMIT}),
+                bytes("")
+            );
+
+            key.currency1.settle(poolManager, address(this), uint256(int256(-delta.amount1())), false);
+            key.currency0.take(poolManager, address(this), uint256(int256(delta.amount0())), false);
+        } else {
+            BalanceDelta delta = poolManager.swap(
+                key,
+                SwapParams({zeroForOne: true, amountSpecified: -int256(amountIn), sqrtPriceLimitX96: MIN_PRICE_LIMIT}),
+                bytes("")
+            );
+
+            key.currency0.settle(poolManager, address(this), uint256(int256(-delta.amount0())), false);
+            key.currency1.take(poolManager, address(this), uint256(int256(delta.amount1())), false);
+        }
+
+        cmdOut = ICommandToken(cmdToken).balanceOf(address(this)) - cmdBefore;
+    }
+
+    function _removeLiquidityShare(uint256)
+        internal
+        returns (uint256 cmdAmountReceived, uint256 pairedAmountReceived)
+    {
+        cmdAmountReceived = 0;
+        pairedAmountReceived = 0;
     }
 
     function _getCurrentPrice(PoolKey calldata key) internal view returns (uint160) {
