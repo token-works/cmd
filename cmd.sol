@@ -41,7 +41,74 @@ contract CMD is ERC20 {
 
     // COMMUNITY_STATE
 
+    /// @notice The participant allocation is 50% of INITIAL_SUPPLY = 500_000_000 ether.
+    ///         25% (250_000_000 ether) is unlocked immediately at launch.
+    ///         25% (250_000_000 ether) vests linearly over 15 days.
+    uint256 public constant PARTICIPANT_ALLOCATION = INITIAL_SUPPLY / 2; // 500M
+    uint256 public constant IMMEDIATE_UNLOCK = PARTICIPANT_ALLOCATION / 2; // 250M
+    uint256 public constant VESTING_AMOUNT = PARTICIPANT_ALLOCATION / 2;  // 250M
+    uint256 public constant VESTING_DURATION = 15 days;
+
+    /// @notice Address that manages the participant allocation (set once via setupVesting)
+    address public vestingManager;
+
+    /// @notice Timestamp when vesting begins
+    uint256 public vestingStart;
+
+    /// @notice Whether vesting has been set up
+    bool public vestingSetup;
+
+    /// @notice Total amount already claimed from the vesting portion
+    uint256 public totalVestingClaimed;
+
     // COMMUNITY_LOGIC
 
+    /// @notice Returns the total amount of vesting tokens that have become claimable so far
+    function vestedAmount() public view returns (uint256) {
+        if (!vestingSetup) return 0;
+        if (block.timestamp >= vestingStart + VESTING_DURATION) {
+            return VESTING_AMOUNT;
+        }
+        return (VESTING_AMOUNT * (block.timestamp - vestingStart)) / VESTING_DURATION;
+    }
+
+    /// @notice Returns the amount of vesting tokens currently available to claim
+    function claimableVesting() public view returns (uint256) {
+        uint256 vested = vestedAmount();
+        if (vested <= totalVestingClaimed) return 0;
+        return vested - totalVestingClaimed;
+    }
+
     // COMMUNITY_FUNCTIONS
+
+    /// @notice Called once by the deployer (msg.sender who holds INITIAL_SUPPLY) to set up the
+    ///         participant allocation. Immediately transfers the 25% unlocked portion to a
+    ///         designated participant address and locks the remaining 25% for linear vesting.
+    /// @param participantAddress The address that receives the immediate unlock and vesting tokens
+    function setupVesting(address participantAddress) external {
+        require(!vestingSetup, "Vesting already setup");
+        require(participantAddress != address(0), "Invalid participant address");
+
+        vestingSetup = true;
+        vestingManager = participantAddress;
+        vestingStart = block.timestamp;
+
+        // Transfer the immediately unlocked 25% to the participant address
+        _transfer(msg.sender, participantAddress, IMMEDIATE_UNLOCK);
+
+        // Transfer the vesting portion to this contract to hold in escrow
+        _transfer(msg.sender, address(this), VESTING_AMOUNT);
+    }
+
+    /// @notice Allows the vesting manager to claim vested tokens that have become available
+    function claimVested() external {
+        require(vestingSetup, "Vesting not setup");
+        require(msg.sender == vestingManager, "Not vesting manager");
+
+        uint256 amount = claimableVesting();
+        require(amount > 0, "Nothing to claim");
+
+        totalVestingClaimed += amount;
+        _transfer(address(this), vestingManager, amount);
+    }
 }
