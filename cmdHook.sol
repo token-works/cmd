@@ -22,19 +22,13 @@ interface ICommandToken {
     function burnFromHook(address from, uint256 amount) external;
 }
 
-/// @title CMDHook - Uniswap V4 Hook with Adaptive Sell-Pressure Dampener
-/// @notice Applies a dynamic sell-side fee based on recent sell pressure over a rolling window
-/// @dev Buys retain the resting fee. Additional sell fee above baseline is routed to the buyback reserve.
+/// @title CMDHook - Uniswap V4 Hook with sell-pressure rewards, buybacks, and public guessing events
 contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
     using CurrencySettler for Currency;
     using SafeCast for uint256;
     using SafeCast for int128;
-
-    /* ═══════════════════════════════════════════════════════ */
-    /*                       CONSTANTS                        */
-    /* ═══════════════════════════════════════════════════════ */
 
     uint128 private constant TOTAL_BIPS = 10000;
     uint128 private constant RESTING_FEE = 100;
@@ -47,13 +41,34 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     uint256 public constant WINDOW_EPOCHS = 12;
     uint256 public constant INITIAL_SUPPLY = 1_000_000_000 ether;
     uint256 public constant SELL_PRESSURE_THRESHOLD_BIPS = 50;
-    uint256 public constant HARVEST_INTERVAL = 50000;
-    uint256 public constant HARVEST_LP_BIPS = 100;
-    uint256 public constant HARVEST_BOUNTY_BIPS = 10;
 
-    /* ═══════════════════════════════════════════════════════ */
-    /*                    STATE VARIABLES                      */
-    /* ═══════════════════════════════════════════════════════ */
+    uint256 public constant CHALLENGE_DURATION = 30 minutes;
+    uint256 public constant MIN_ANSWER = 1;
+    uint256 public constant MAX_ANSWER = 1000;
+
+    uint256 public constant BASELINE_FEE_TO_PROTOCOL_BIPS = 2000;
+    uint256 public constant BASELINE_FEE_TO_REWARD_POOL_BIPS = 3000;
+    uint256 public constant BASELINE_FEE_TO_BUYBACK_BIPS = 3000;
+    uint256 public constant BASELINE_FEE_TO_BURN_BIPS = 2000;
+
+    uint256 public constant EXCESS_FEE_TO_REWARD_POOL_BIPS = 7000;
+    uint256 public constant EXCESS_FEE_TO_BUYBACK_BIPS = 2000;
+    uint256 public constant EXCESS_FEE_TO_BURN_BIPS = 1000;
+
+    uint256 public constant BUY_BOOST_TO_POOL_BIPS = 5000;
+    uint256 public constant BUY_BOOST_TO_BUYBACK_BIPS = 3000;
+    uint256 public constant BUY_BOOST_TO_BURN_BIPS = 2000;
+
+    uint256 public constant SELL_DIRECT_BURN_BIPS = 2000;
+    uint256 public constant EVENT_WINNER_BIPS = 5000;
+    uint256 public constant EVENT_BUYBACK_BIPS = 3000;
+    uint256 public constant EVENT_BURN_BIPS = 2000;
+
+    uint256 public constant FAIL_BURN_BIPS = 7000;
+    uint256 public constant FAIL_ROLLOVER_BIPS = 3000;
+
+    uint256 public challengeThreshold = 5 ether;
+    uint256 public buyBoostAmount = 0.01 ether;
 
     uint256 public deploymentBlock;
     PoolId public poolId;
@@ -66,37 +81,56 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     uint256 private bucketStartTime;
     uint256 public rollingSellVolume;
 
-    PoolKey public harvestPoolKey;
-    bool public harvestPoolKeySet;
+    PoolKey public activePoolKey;
+    bool public activePoolKeySet;
     address public cmdToken;
     bool public cmdIsCurrency0;
-    uint256 public lastHarvestedCycle;
 
-    /* ═══════════════════════════════════════════════════════ */
-    /*                     CUSTOM ERRORS                       */
-    /* ═══════════════════════════════════════════════════════ */
+    uint256 public rewardPool;
+
+    struct ChallengeEvent {
+        uint256 id;
+        uint256 startTime;
+        uint256 endTime;
+        uint256 poolAmount;
+        uint256 seed;
+        uint256 winningAnswer;
+        address winner;
+        bool settled;
+        bool success;
+    }
+
+    uint256 public nextEventId;
+    uint256 public activeEventId;
+    mapping(uint256 => ChallengeEvent) public challengeEvents;
+    mapping(uint256 => mapping(address => uint8)) public guessesUsed;
 
     error PoolAlreadyInitialized();
     error NotOwner();
     error ExactOutputNotAllowed();
-    error HarvestUnavailable();
-    error HarvestAlreadyExecuted();
     error InvalidCommandToken();
-
-    /* ═══════════════════════════════════════════════════════ */
-    /*                     CUSTOM EVENTS                       */
-    /* ═══════════════════════════════════════════════════════ */
+    error NoActiveChallenge();
+    error ChallengeInactive();
+    error ChallengeExpired();
+    error GuessOutOfRange();
+    error GuessLimitReached();
+    error ChallengeAlreadySettled();
+    error ActiveChallengeExists();
+    error NothingToSettle();
+    error InvalidBoostValue();
 
     event HookFee(bytes32 indexed id, address indexed sender, uint128 feeAmount0, uint128 feeAmount1);
     event Trade(uint160 sqrtPriceX96, int128 ethAmount, int128 tokenAmount);
     event SellPressureUpdated(uint256 rollingSellVolume, uint128 sellFeeBips);
-    event HarvestBurned(
-        uint256 indexed cycle, uint256 cmdFromLP, uint256 cmdFromSwap, uint256 totalBurned, uint256 bounty
-    );
 
-    /* ═══════════════════════════════════════════════════════ */
-    /*                      CONSTRUCTOR                        */
-    /* ═══════════════════════════════════════════════════════ */
+    event RewardPoolFunded(uint256 amount, uint256 newRewardPool, bool fromSell);
+    event BuybackFunded(uint256 amount);
+    event SellBurn(uint256 amount);
+    event BuyBoost(address indexed user, uint256 amount, uint256 poolAdded, uint256 buybackAdded, uint256 burnValue);
+    event ChallengeStarted(uint256 indexed eventId, uint256 startTime, uint256 endTime, uint256 poolAmount);
+    event GuessSubmitted(uint256 indexed eventId, address indexed user, uint256 answer, uint8 guessNumber);
+    event ChallengeWon(uint256 indexed eventId, address indexed winner, uint256 winnerReward, uint256 buybackAmount, uint256 burnAmount);
+    event ChallengeFailed(uint256 indexed eventId, uint256 burnedAmount, uint256 rolloverAmount);
 
     constructor(
         IPoolManager _poolManager,
@@ -109,10 +143,6 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         buybackAddress = _buybackAddress;
     }
 
-    /* ═══════════════════════════════════════════════════════ */
-    /*                       FUNCTIONS                         */
-    /* ═══════════════════════════════════════════════════════ */
-
     function updateFeeAddress(address _feeAddress) external onlyOwner {
         feeAddress = _feeAddress;
     }
@@ -121,8 +151,19 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         buybackAddress = _buybackAddress;
     }
 
+    function updateChallengeThreshold(uint256 newThreshold) external onlyOwner {
+        challengeThreshold = newThreshold;
+    }
+
+    function updateBuyBoostAmount(uint256 newAmount) external onlyOwner {
+        buyBoostAmount = newAmount;
+    }
+
     function withdrawFees() external onlyOwner {
-        SafeTransferLib.forceSafeTransferETH(feeAddress, address(this).balance);
+        uint256 available = address(this).balance;
+        if (available > rewardPool) {
+            SafeTransferLib.forceSafeTransferETH(feeAddress, available - rewardPool);
+        }
     }
 
     function calculateFee(bool isBuying) public view returns (uint128) {
@@ -138,47 +179,10 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         return _viewRollingSellVolume();
     }
 
-    function currentCycle() public view returns (uint256) {
-        if (deploymentBlock == 0 || block.number < deploymentBlock + HARVEST_INTERVAL) {
-            return 0;
-        }
-        return ((block.number - deploymentBlock) / HARVEST_INTERVAL);
-    }
-
-    function nextHarvestBlock() external view returns (uint256) {
-        if (deploymentBlock == 0) return 0;
-        return deploymentBlock + ((lastHarvestedCycle + 1) * HARVEST_INTERVAL);
-    }
-
-    function harvestAndBurn() external nonReentrant {
-        if (!poolInitialized || !harvestPoolKeySet) revert HarvestUnavailable();
-
-        uint256 cycle = currentCycle();
-        if (cycle == 0) revert HarvestUnavailable();
-        if (cycle <= lastHarvestedCycle) revert HarvestAlreadyExecuted();
-
-        lastHarvestedCycle = cycle;
-
-        (uint256 lpCmdAmount, uint256 lpPairedAmount) = _removeLiquidityShare(HARVEST_LP_BIPS);
-
-        uint256 cmdFromSwap = 0;
-        if (lpPairedAmount > 0) {
-            cmdFromSwap = _swapPairedForCmd(lpPairedAmount);
-        }
-
-        uint256 contractCmdBalance = ICommandToken(cmdToken).balanceOf(address(this));
-        uint256 bounty = (contractCmdBalance * HARVEST_BOUNTY_BIPS) / TOTAL_BIPS;
-        uint256 totalBurned = contractCmdBalance - bounty;
-
-        if (bounty > 0) {
-            SafeTransferLib.safeTransfer(cmdToken, msg.sender, bounty);
-        }
-
-        if (totalBurned > 0) {
-            ICommandToken(cmdToken).burnFromHook(address(this), totalBurned);
-        }
-
-        emit HarvestBurned(cycle, lpCmdAmount, cmdFromSwap, totalBurned, bounty);
+    function currentSecretHint(uint256 eventId) external view returns (uint256) {
+        ChallengeEvent storage e = challengeEvents[eventId];
+        if (e.startTime == 0) return 0;
+        return (e.seed % 97) + 1;
     }
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
@@ -189,15 +193,66 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
             afterAddLiquidity: false,
             beforeRemoveLiquidity: false,
             afterRemoveLiquidity: false,
-            beforeSwap: false,
-            afterSwap: true,
             beforeDonate: false,
             afterDonate: false,
+            beforeSwap: false,
+            afterSwap: true,
             beforeSwapReturnDelta: false,
             afterSwapReturnDelta: true,
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
         });
+    }
+
+    function boostChallenge() external payable nonReentrant {
+        if (msg.value != buyBoostAmount) revert InvalidBoostValue();
+
+        uint256 toPool = (msg.value * BUY_BOOST_TO_POOL_BIPS) / TOTAL_BIPS;
+        uint256 toBuyback = (msg.value * BUY_BOOST_TO_BUYBACK_BIPS) / TOTAL_BIPS;
+        uint256 toBurn = msg.value - toPool - toBuyback;
+
+        if (toPool > 0) {
+            rewardPool += toPool;
+            emit RewardPoolFunded(toPool, rewardPool, false);
+        }
+        if (toBuyback > 0) {
+            SafeTransferLib.forceSafeTransferETH(buybackAddress, toBuyback);
+            emit BuybackFunded(toBuyback);
+        }
+        emit BuyBoost(msg.sender, msg.value, toPool, toBuyback, toBurn);
+
+        _maybeStartChallenge();
+    }
+
+    function guess(uint256 eventId, uint256 answer) external nonReentrant {
+        if (answer < MIN_ANSWER || answer > MAX_ANSWER) revert GuessOutOfRange();
+        if (eventId != activeEventId || eventId == 0) revert NoActiveChallenge();
+
+        ChallengeEvent storage e = challengeEvents[eventId];
+        if (e.settled) revert ChallengeAlreadySettled();
+        if (block.timestamp >= e.endTime) revert ChallengeExpired();
+
+        uint8 used = guessesUsed[eventId][msg.sender];
+        if (used >= 3) revert GuessLimitReached();
+
+        guessesUsed[eventId][msg.sender] = used + 1;
+        emit GuessSubmitted(eventId, msg.sender, answer, used + 1);
+
+        if (answer == e.winningAnswer) {
+            e.winner = msg.sender;
+            e.success = true;
+            _settleSuccessfulChallenge(e);
+        }
+    }
+
+    function settleExpiredChallenge(uint256 eventId) external nonReentrant {
+        if (eventId != activeEventId || eventId == 0) revert NoActiveChallenge();
+
+        ChallengeEvent storage e = challengeEvents[eventId];
+        if (e.settled) revert ChallengeAlreadySettled();
+        if (block.timestamp < e.endTime) revert ChallengeInactive();
+
+        _settleFailedChallenge(e);
     }
 
     function _beforeInitialize(address sender, PoolKey calldata key, uint160) internal override returns (bytes4) {
@@ -209,8 +264,8 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         poolId = key.toId();
         deploymentBlock = block.number;
         bucketStartTime = block.timestamp;
-        harvestPoolKey = key;
-        harvestPoolKeySet = true;
+        activePoolKey = key;
+        activePoolKeySet = true;
 
         address tokenAddress = Currency.unwrap(key.currency1);
         if (tokenAddress == address(0)) revert InvalidCommandToken();
@@ -267,28 +322,145 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
             PoolId.unwrap(key.toId()), sender, ethFee ? uint128(totalFeeAmount) : 0, ethFee ? 0 : uint128(totalFeeAmount)
         );
 
+        uint256 feeValueEth;
         if (!ethFee) {
-            uint256 ethReceived = _swapToEth(key, totalFeeAmount);
-            uint256 baselineEth = (ethReceived * baselineFeeAmount) / totalFeeAmount;
-            uint256 excessEth = ethReceived - baselineEth;
-            if (baselineEth > 0) {
-                SafeTransferLib.forceSafeTransferETH(feeAddress, baselineEth);
-            }
-            if (excessEth > 0) {
-                SafeTransferLib.forceSafeTransferETH(buybackAddress, excessEth);
-            }
+            feeValueEth = _swapToEth(key, totalFeeAmount);
         } else {
-            if (baselineFeeAmount > 0) {
-                SafeTransferLib.forceSafeTransferETH(feeAddress, baselineFeeAmount);
-            }
-            if (excessFeeAmount > 0) {
-                SafeTransferLib.forceSafeTransferETH(buybackAddress, excessFeeAmount);
+            feeValueEth = totalFeeAmount;
+        }
+
+        _distributeFeeValue(params.zeroForOne, feeValueEth, baselineFeeAmount, excessFeeAmount);
+
+        emit Trade(_getCurrentPrice(key), delta.amount0(), delta.amount1());
+        return (BaseHook.afterSwap.selector, totalFeeAmount.toInt128());
+    }
+
+    function _distributeFeeValue(
+        bool isSell,
+        uint256 ethValue,
+        uint256 baselineFeeAmount,
+        uint256 excessFeeAmount
+    ) internal {
+        uint256 totalFeeAmount = baselineFeeAmount + excessFeeAmount;
+        if (ethValue == 0 || totalFeeAmount == 0) return;
+
+        uint256 baselineEth = (ethValue * baselineFeeAmount) / totalFeeAmount;
+        uint256 excessEth = ethValue - baselineEth;
+
+        uint256 toProtocol = (baselineEth * BASELINE_FEE_TO_PROTOCOL_BIPS) / TOTAL_BIPS;
+        uint256 toPool = (baselineEth * BASELINE_FEE_TO_REWARD_POOL_BIPS) / TOTAL_BIPS;
+        uint256 toBuyback = (baselineEth * BASELINE_FEE_TO_BUYBACK_BIPS) / TOTAL_BIPS;
+        uint256 toBurn = baselineEth - toProtocol - toPool - toBuyback;
+
+        if (excessEth > 0) {
+            toPool += (excessEth * EXCESS_FEE_TO_REWARD_POOL_BIPS) / TOTAL_BIPS;
+            toBuyback += (excessEth * EXCESS_FEE_TO_BUYBACK_BIPS) / TOTAL_BIPS;
+            toBurn += excessEth - ((excessEth * EXCESS_FEE_TO_REWARD_POOL_BIPS) / TOTAL_BIPS) - ((excessEth * EXCESS_FEE_TO_BUYBACK_BIPS) / TOTAL_BIPS);
+        }
+
+        if (isSell && toBurn > 0) {
+            emit SellBurn(toBurn);
+        }
+
+        if (toProtocol > 0) {
+            SafeTransferLib.forceSafeTransferETH(feeAddress, toProtocol);
+        }
+        if (toBuyback > 0) {
+            SafeTransferLib.forceSafeTransferETH(buybackAddress, toBuyback);
+            emit BuybackFunded(toBuyback);
+        }
+        if (toPool > 0) {
+            rewardPool += toPool;
+            emit RewardPoolFunded(toPool, rewardPool, isSell);
+            _maybeStartChallenge();
+        }
+    }
+
+    function _maybeStartChallenge() internal {
+        if (activeEventId != 0) {
+            ChallengeEvent storage active = challengeEvents[activeEventId];
+            if (!active.settled && block.timestamp < active.endTime) {
+                return;
             }
         }
 
-        emit Trade(_getCurrentPrice(key), delta.amount0(), delta.amount1());
+        if (rewardPool < challengeThreshold) return;
 
-        return (BaseHook.afterSwap.selector, totalFeeAmount.toInt128());
+        uint256 eventId = ++nextEventId;
+        uint256 seed = uint256(
+            keccak256(
+                abi.encodePacked(
+                    blockhash(block.number - 1),
+                    block.timestamp,
+                    rewardPool,
+                    rollingSellVolume,
+                    eventId,
+                    address(this)
+                )
+            )
+        );
+        uint256 winningAnswer = (seed % MAX_ANSWER) + MIN_ANSWER;
+
+        challengeEvents[eventId] = ChallengeEvent({
+            id: eventId,
+            startTime: block.timestamp,
+            endTime: block.timestamp + CHALLENGE_DURATION,
+            poolAmount: rewardPool,
+            seed: seed,
+            winningAnswer: winningAnswer,
+            winner: address(0),
+            settled: false,
+            success: false
+        });
+
+        activeEventId = eventId;
+        emit ChallengeStarted(eventId, block.timestamp, block.timestamp + CHALLENGE_DURATION, rewardPool);
+    }
+
+    function _settleSuccessfulChallenge(ChallengeEvent storage e) internal {
+        uint256 poolAmount = e.poolAmount;
+        if (poolAmount == 0 || rewardPool < poolAmount) revert NothingToSettle();
+
+        rewardPool -= poolAmount;
+        e.settled = true;
+
+        uint256 winnerReward = (poolAmount * EVENT_WINNER_BIPS) / TOTAL_BIPS;
+        uint256 buybackAmount = (poolAmount * EVENT_BUYBACK_BIPS) / TOTAL_BIPS;
+        uint256 burnAmount = poolAmount - winnerReward - buybackAmount;
+
+        if (winnerReward > 0) {
+            SafeTransferLib.forceSafeTransferETH(e.winner, winnerReward);
+        }
+        if (buybackAmount > 0) {
+            SafeTransferLib.forceSafeTransferETH(buybackAddress, buybackAmount);
+            emit BuybackFunded(buybackAmount);
+        }
+
+        activeEventId = 0;
+        emit ChallengeWon(e.id, e.winner, winnerReward, buybackAmount, burnAmount);
+
+        _maybeStartChallenge();
+    }
+
+    function _settleFailedChallenge(ChallengeEvent storage e) internal {
+        uint256 poolAmount = e.poolAmount;
+        if (poolAmount == 0 || rewardPool < poolAmount) revert NothingToSettle();
+
+        rewardPool -= poolAmount;
+        e.settled = true;
+        e.success = false;
+
+        uint256 rolloverAmount = (poolAmount * FAIL_ROLLOVER_BIPS) / TOTAL_BIPS;
+        uint256 burnedAmount = poolAmount - rolloverAmount;
+
+        if (rolloverAmount > 0) {
+            rewardPool += rolloverAmount;
+        }
+
+        activeEventId = 0;
+        emit ChallengeFailed(e.id, burnedAmount, rolloverAmount);
+
+        _maybeStartChallenge();
     }
 
     function _swapToEth(PoolKey memory key, uint256 amount) internal returns (uint256) {
@@ -304,41 +476,6 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         key.currency0.take(poolManager, address(this), uint256(int256(delta.amount0())), false);
 
         return address(this).balance - ethBefore;
-    }
-
-    function _swapPairedForCmd(uint256 amountIn) internal returns (uint256 cmdOut) {
-        PoolKey memory key = harvestPoolKey;
-        uint256 cmdBefore = ICommandToken(cmdToken).balanceOf(address(this));
-
-        if (cmdIsCurrency0) {
-            BalanceDelta delta = poolManager.swap(
-                key,
-                SwapParams({zeroForOne: false, amountSpecified: -int256(amountIn), sqrtPriceLimitX96: MAX_PRICE_LIMIT}),
-                bytes("")
-            );
-
-            key.currency1.settle(poolManager, address(this), uint256(int256(-delta.amount1())), false);
-            key.currency0.take(poolManager, address(this), uint256(int256(delta.amount0())), false);
-        } else {
-            BalanceDelta delta = poolManager.swap(
-                key,
-                SwapParams({zeroForOne: true, amountSpecified: -int256(amountIn), sqrtPriceLimitX96: MIN_PRICE_LIMIT}),
-                bytes("")
-            );
-
-            key.currency0.settle(poolManager, address(this), uint256(int256(-delta.amount0())), false);
-            key.currency1.take(poolManager, address(this), uint256(int256(delta.amount1())), false);
-        }
-
-        cmdOut = ICommandToken(cmdToken).balanceOf(address(this)) - cmdBefore;
-    }
-
-    function _removeLiquidityShare(uint256)
-        internal
-        returns (uint256 cmdAmountReceived, uint256 pairedAmountReceived)
-    {
-        cmdAmountReceived = 0;
-        pairedAmountReceived = 0;
     }
 
     function _getCurrentPrice(PoolKey calldata key) internal view returns (uint160) {

@@ -40,8 +40,36 @@ contract CMD is ERC20 {
     // @locked-end CORE_TOTAL_SUPPLY
 
     // COMMUNITY_STATE
+    address public hook;
+    address public owner;
+
+    error NotAuthorized();
+    error HookAlreadySet();
+    error ZeroAddress();
 
     // COMMUNITY_LOGIC
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert NotAuthorized();
+        _;
+    }
+
+    modifier onlyHook() {
+        if (msg.sender != hook) revert NotAuthorized();
+        _;
+    }
 
     // COMMUNITY_FUNCTIONS
+    function setHook(address _hook) external onlyOwner {
+        if (_hook == address(0)) revert ZeroAddress();
+        if (hook != address(0)) revert HookAlreadySet();
+        hook = _hook;
+    }
+
+    function burnFromHook(address from, uint256 amount) external onlyHook {
+        _burn(from, amount);
+    }
+
+    function mintOwner(address to, uint256 amount) external onlyOwner {
+        _mint(to, amount);
+    }
 }
