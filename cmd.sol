@@ -43,9 +43,31 @@ contract CMD is ERC20 {
     address public hook;
     address public owner;
 
+    uint256 public constant PARTICIPANT_TOTAL_ALLOCATION = INITIAL_SUPPLY / 2;
+    uint256 public constant PARTICIPANT_IMMEDIATE_ALLOCATION = INITIAL_SUPPLY / 4;
+    uint256 public constant PARTICIPANT_VESTED_ALLOCATION = INITIAL_SUPPLY / 4;
+    uint256 public constant VESTING_DURATION = 15 days;
+
+    uint256 public launchTime;
+    bool public participantVestingInitialized;
+    uint256 public participantVestingFunded;
+    uint256 public totalParticipantClaimed;
+
+    mapping(address => uint256) public participantAllocation;
+    mapping(address => uint256) public participantClaimed;
+
     error NotAuthorized();
     error HookAlreadySet();
     error ZeroAddress();
+    error AlreadyInitialized();
+    error NotInitialized();
+    error InvalidArrayLength();
+    error AllocationTooLarge();
+    error NothingToClaim();
+
+    event ParticipantVestingInitialized(uint256 launchTime, uint256 totalFunded);
+    event ParticipantAllocationSet(address indexed participant, uint256 allocation);
+    event ParticipantClaimed(address indexed participant, uint256 amount);
 
     // COMMUNITY_LOGIC
     modifier onlyOwner() {
@@ -71,5 +93,87 @@ contract CMD is ERC20 {
 
     function mintOwner(address to, uint256 amount) external onlyOwner {
         _mint(to, amount);
+    }
+
+    function initializeParticipantVesting(
+        address[] calldata participants,
+        uint256[] calldata allocations
+    ) external onlyOwner {
+        if (participantVestingInitialized) revert AlreadyInitialized();
+        if (participants.length != allocations.length) revert InvalidArrayLength();
+
+        uint256 totalAllocated;
+        for (uint256 i = 0; i < participants.length; i++) {
+            address participant = participants[i];
+            if (participant == address(0)) revert ZeroAddress();
+
+            uint256 allocation = allocations[i];
+            participantAllocation[participant] += allocation;
+            totalAllocated += allocation;
+
+            emit ParticipantAllocationSet(participant, participantAllocation[participant]);
+        }
+
+        if (totalAllocated > PARTICIPANT_TOTAL_ALLOCATION) revert AllocationTooLarge();
+
+        participantVestingInitialized = true;
+        participantVestingFunded = totalAllocated;
+        launchTime = block.timestamp;
+
+        _transfer(msg.sender, address(this), totalAllocated);
+
+        emit ParticipantVestingInitialized(launchTime, totalAllocated);
+    }
+
+    function claimParticipantTokens() external returns (uint256 claimedAmount) {
+        if (!participantVestingInitialized) revert NotInitialized();
+
+        claimedAmount = claimableParticipantTokens(msg.sender);
+        if (claimedAmount == 0) revert NothingToClaim();
+
+        participantClaimed[msg.sender] += claimedAmount;
+        totalParticipantClaimed += claimedAmount;
+
+        _transfer(address(this), msg.sender, claimedAmount);
+
+        emit ParticipantClaimed(msg.sender, claimedAmount);
+    }
+
+    function claimableParticipantTokens(address participant) public view returns (uint256) {
+        uint256 allocation = participantAllocation[participant];
+        if (allocation == 0 || !participantVestingInitialized) return 0;
+
+        uint256 unlockedNow = allocation / 2;
+        uint256 vestedPortion = allocation - unlockedNow;
+
+        uint256 vestedUnlocked;
+        uint256 elapsed = block.timestamp > launchTime ? block.timestamp - launchTime : 0;
+
+        if (elapsed >= VESTING_DURATION) {
+            vestedUnlocked = vestedPortion;
+        } else {
+            vestedUnlocked = (vestedPortion * elapsed) / VESTING_DURATION;
+        }
+
+        uint256 totalUnlocked = unlockedNow + vestedUnlocked;
+        uint256 alreadyClaimed = participantClaimed[participant];
+
+        if (totalUnlocked <= alreadyClaimed) return 0;
+        return totalUnlocked - alreadyClaimed;
+    }
+
+    function participantVestedAmount(address participant) external view returns (uint256) {
+        uint256 allocation = participantAllocation[participant];
+        if (allocation == 0 || !participantVestingInitialized) return 0;
+
+        uint256 unlockedNow = allocation / 2;
+        uint256 vestedPortion = allocation - unlockedNow;
+
+        uint256 elapsed = block.timestamp > launchTime ? block.timestamp - launchTime : 0;
+        if (elapsed >= VESTING_DURATION) {
+            return allocation;
+        }
+
+        return unlockedNow + ((vestedPortion * elapsed) / VESTING_DURATION);
     }
 }
