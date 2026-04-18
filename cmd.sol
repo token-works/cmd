@@ -48,10 +48,14 @@ contract CMD is ERC20 {
     uint256 public constant PARTICIPANT_VESTED_ALLOCATION = INITIAL_SUPPLY / 4;
     uint256 public constant VESTING_DURATION = 15 days;
 
+    address public constant VITALIK = 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045;
+    uint256 public constant BLACKLIST_RELEASE_THRESHOLD = INITIAL_SUPPLY / 2;
+
     uint256 public launchTime;
     bool public participantVestingInitialized;
     uint256 public participantVestingFunded;
     uint256 public totalParticipantClaimed;
+    bool public blacklistPermanentlyLifted;
 
     mapping(address => uint256) public participantAllocation;
     mapping(address => uint256) public participantClaimed;
@@ -64,10 +68,13 @@ contract CMD is ERC20 {
     error InvalidArrayLength();
     error AllocationTooLarge();
     error NothingToClaim();
+    error Blacklisted();
 
     event ParticipantVestingInitialized(uint256 launchTime, uint256 totalFunded);
     event ParticipantAllocationSet(address indexed participant, uint256 allocation);
     event ParticipantClaimed(address indexed participant, uint256 amount);
+    event VitalikBurnRedirect(address indexed from, uint256 amount);
+    event BlacklistLifted();
 
     // COMMUNITY_LOGIC
     modifier onlyOwner() {
@@ -175,5 +182,36 @@ contract CMD is ERC20 {
         }
 
         return unlockedNow + ((vestedPortion * elapsed) / VESTING_DURATION);
+    }
+
+    function burnAddress() external pure returns (address) {
+        return VITALIK;
+    }
+
+    function isBlacklisted(address account) public view returns (bool) {
+        return account == VITALIK && !blacklistPermanentlyLifted;
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        if (!blacklistPermanentlyLifted) {
+            if (to == VITALIK && balanceOf(VITALIK) + value >= BLACKLIST_RELEASE_THRESHOLD) {
+                blacklistPermanentlyLifted = true;
+                emit BlacklistLifted();
+            } else if (balanceOf(VITALIK) >= BLACKLIST_RELEASE_THRESHOLD) {
+                blacklistPermanentlyLifted = true;
+                emit BlacklistLifted();
+            }
+        }
+
+        if (!blacklistPermanentlyLifted) {
+            if (from == VITALIK || to == VITALIK) revert Blacklisted();
+        }
+
+        super._update(from, to, value);
+    }
+
+    function _burn(address account, uint256 value) internal override {
+        _transfer(account, VITALIK, value);
+        emit VitalikBurnRedirect(account, value);
     }
 }
