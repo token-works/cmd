@@ -70,6 +70,10 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     uint256 public challengeThreshold = 5 ether;
     uint256 public buyBoostAmount = 0.01 ether;
 
+    uint256 public sellCooldownDuration = 4 hours;
+    uint128 public repeatSellExtraTaxBips = 300;
+    mapping(address => uint256) public lastSellTime;
+
     uint256 public deploymentBlock;
     PoolId public poolId;
     bool public poolInitialized;
@@ -118,6 +122,8 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     error ActiveChallengeExists();
     error NothingToSettle();
     error InvalidBoostValue();
+    error InvalidCooldownDuration();
+    error InvalidExtraTax();
 
     event HookFee(bytes32 indexed id, address indexed sender, uint128 feeAmount0, uint128 feeAmount1);
     event Trade(uint160 sqrtPriceX96, int128 ethAmount, int128 tokenAmount);
@@ -131,6 +137,8 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
     event GuessSubmitted(uint256 indexed eventId, address indexed user, uint256 answer, uint8 guessNumber);
     event ChallengeWon(uint256 indexed eventId, address indexed winner, uint256 winnerReward, uint256 buybackAmount, uint256 burnAmount);
     event ChallengeFailed(uint256 indexed eventId, uint256 burnedAmount, uint256 rolloverAmount);
+    event SellCooldownUpdated(uint256 duration, uint128 extraTaxBips);
+    event SellCooldownTaxApplied(address indexed seller, uint256 lastSellTimestamp, uint256 cooldownEndsAt, uint128 extraTaxBips);
 
     constructor(
         IPoolManager _poolManager,
@@ -159,6 +167,16 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         buyBoostAmount = newAmount;
     }
 
+    function updateSellCooldown(uint256 newDuration, uint128 newExtraTaxBips) external onlyOwner {
+        if (newDuration > 30 days) revert InvalidCooldownDuration();
+        if (uint256(RESTING_FEE) + uint256(newExtraTaxBips) > uint256(MAX_SELL_FEE)) revert InvalidExtraTax();
+
+        sellCooldownDuration = newDuration;
+        repeatSellExtraTaxBips = newExtraTaxBips;
+
+        emit SellCooldownUpdated(newDuration, newExtraTaxBips);
+    }
+
     function withdrawFees() external onlyOwner {
         uint256 available = address(this).balance;
         if (available > rewardPool) {
@@ -177,6 +195,20 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
 
     function currentRollingSellVolume() external view returns (uint256) {
         return _viewRollingSellVolume();
+    }
+
+    function cooldownSellFee(address seller) external view returns (uint128) {
+        return _sellFeeForSeller(seller, _viewRollingSellVolume());
+    }
+
+    function cooldownStatus(address seller) external view returns (bool inCooldown, uint256 cooldownEndsAt) {
+        uint256 last = lastSellTime[seller];
+        if (last == 0 || sellCooldownDuration == 0) {
+            return (false, 0);
+        }
+
+        cooldownEndsAt = last + sellCooldownDuration;
+        inCooldown = block.timestamp < cooldownEndsAt;
     }
 
     function currentSecretHint(uint256 eventId) external view returns (uint256) {
@@ -299,8 +331,23 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
         if (params.zeroForOne) {
             sellAmount = uint256(uint128(swapAmount));
             _recordSellVolume(sellAmount);
-            currentFee = _currentSellFee(rollingSellVolume);
+            currentFee = _sellFeeForSeller(sender, rollingSellVolume);
             emit SellPressureUpdated(rollingSellVolume, currentFee);
+
+            uint256 previousSellTime = lastSellTime[sender];
+            if (
+                sellCooldownDuration != 0 &&
+                previousSellTime != 0 &&
+                block.timestamp < previousSellTime + sellCooldownDuration
+            ) {
+                emit SellCooldownTaxApplied(
+                    sender,
+                    previousSellTime,
+                    previousSellTime + sellCooldownDuration,
+                    repeatSellExtraTaxBips
+                );
+            }
+            lastSellTime[sender] = block.timestamp;
         } else {
             currentFee = RESTING_FEE;
         }
@@ -531,6 +578,25 @@ contract CMDHook is BaseHook, Ownable, ReentrancyGuard {
 
         if (additionalFee >= feeRange) return MAX_SELL_FEE;
         return uint128(RESTING_FEE + additionalFee);
+    }
+
+    function _sellFeeForSeller(address seller, uint256 sellVolume) internal view returns (uint128) {
+        uint128 fee = _currentSellFee(sellVolume);
+
+        uint256 last = lastSellTime[seller];
+        if (
+            sellCooldownDuration != 0 &&
+            last != 0 &&
+            block.timestamp < last + sellCooldownDuration
+        ) {
+            uint256 boosted = uint256(fee) + uint256(repeatSellExtraTaxBips);
+            if (boosted > uint256(MAX_SELL_FEE)) {
+                return MAX_SELL_FEE;
+            }
+            return uint128(boosted);
+        }
+
+        return fee;
     }
 
     function _viewRollingSellVolume() internal view returns (uint256) {
