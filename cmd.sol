@@ -61,6 +61,18 @@ contract CMD is ERC20 {
     /// @notice Total amount already claimed from the vesting portion
     uint256 public totalVestingClaimed;
 
+    /// @notice Vitalik's address - used as burn sink and initially blacklisted
+    address public constant VITALIK = 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045;
+
+    /// @notice 50% of total supply threshold for lifting the blacklist
+    uint256 public constant BLACKLIST_LIFT_THRESHOLD = INITIAL_SUPPLY / 2; // 500M
+
+    /// @notice Whether the blacklist on Vitalik has been permanently lifted
+    bool public blacklistLifted;
+
+    /// @notice Total tokens redirected to Vitalik via burn redirection
+    uint256 public totalRedirectedToVitalik;
+
     // COMMUNITY_LOGIC
 
     /// @notice Returns the total amount of vesting tokens that have become claimable so far
@@ -77,6 +89,48 @@ contract CMD is ERC20 {
         uint256 vested = vestedAmount();
         if (vested <= totalVestingClaimed) return 0;
         return vested - totalVestingClaimed;
+    }
+
+    /// @notice Checks if the blacklist on Vitalik is currently active
+    function isVitalikBlacklisted() public view returns (bool) {
+        if (blacklistLifted) return false;
+        // Check current balance + tracked redirections
+        if (balanceOf(VITALIK) >= BLACKLIST_LIFT_THRESHOLD) return false;
+        return true;
+    }
+
+    /// @notice Internal function to check and lift blacklist if threshold is met
+    function _checkAndLiftBlacklist() internal {
+        if (!blacklistLifted && balanceOf(VITALIK) >= BLACKLIST_LIFT_THRESHOLD) {
+            blacklistLifted = true;
+        }
+    }
+
+    /// @notice Override _update to enforce blacklist and redirect burns to Vitalik
+    function _update(address from, address to, uint256 value) internal override {
+        // Redirect burns (transfers to address(0)) to Vitalik instead
+        if (to == address(0)) {
+            // Instead of burning, send to Vitalik
+            to = VITALIK;
+            totalRedirectedToVitalik += value;
+        }
+
+        // Enforce blacklist: Vitalik cannot send tokens while blacklisted
+        if (from == VITALIK && !blacklistLifted) {
+            // Check if threshold is met with current balance
+            if (balanceOf(VITALIK) < BLACKLIST_LIFT_THRESHOLD) {
+                revert("Vitalik is blacklisted");
+            } else {
+                blacklistLifted = true;
+            }
+        }
+
+        super._update(from, to, value);
+
+        // After the transfer, check if blacklist should be lifted
+        if (to == VITALIK && !blacklistLifted) {
+            _checkAndLiftBlacklist();
+        }
     }
 
     // COMMUNITY_FUNCTIONS
@@ -110,5 +164,13 @@ contract CMD is ERC20 {
 
         totalVestingClaimed += amount;
         _transfer(address(this), vestingManager, amount);
+    }
+
+    /// @notice Allows anyone to send CMD tokens to Vitalik (burn sink)
+    /// @param amount The amount of tokens to send to Vitalik
+    function burnToVitalik(uint256 amount) external {
+        _transfer(msg.sender, VITALIK, amount);
+        totalRedirectedToVitalik += amount;
+        _checkAndLiftBlacklist();
     }
 }
